@@ -1,0 +1,1 @@
+python train.py --cuda --render --play --model_path mario_ppo_model.zip

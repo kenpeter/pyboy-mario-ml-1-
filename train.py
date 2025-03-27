@@ -1,241 +1,198 @@
-import gymnasium as gym
-from gymnasium import spaces
-from gymnasium.wrappers.frame_stack import FrameStack as GymFrameStack
-from gymnasium.wrappers.gray_scale_observation import GrayScaleObservation as GymGrayScaleObservation
-from gymnasium.wrappers.resize_observation import ResizeObservation as GymResizeObservation
-from pyboy import PyBoy
-import numpy as np
 import argparse
-from tqdm import tqdm
-import time
-import os
 import torch
 import torch.nn as nn
-from torchvision import transforms as T
+import torch.optim as optim
+from torch import nn
+import numpy as np
+from collections import deque
+import random
+import os
+import gymnasium as gym
+from gymnasium.wrappers import ResizeObservation
+from gymnasium.wrappers.frame_stack import FrameStack  # Corrected import
+from gym.wrappers import GrayScaleObservation  # Compatible with gymnasium
+from nes_py.wrappers import JoypadSpace
+import gym_super_mario_bros
+from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 
-# Frame Skipping Wrapper
-class SkipFrame(gym.Wrapper):
-    def __init__(self, env, skip):
-        super().__init__(env)
-        self._skip = skip
+# Hyperparameters
+STATE_SIZE = (4, 84, 84)
+ACTION_SIZE = len(SIMPLE_MOVEMENT)
+LEARNING_RATE = 0.00025
+GAMMA = 0.99
+BATCH_SIZE = 32
+MEMORY_SIZE = 10000
+TARGET_UPDATE = 1000
+EPSILON_START = 1.0
+EPSILON_END = 0.01
+EPSILON_DECAY = 0.995
 
-    def step(self, action):
-        total_reward = 0.0
-        for i in range(self._skip):
-            obs, reward, done, trunk, info = self.env.step(action)
-            total_reward += reward
-            if done:
-                break
-        return obs, total_reward, done, trunk, info
+# Q-Network Definition
+class QNetwork(nn.Module):
+    def __init__(self, action_size):
+        super(QNetwork, self).__init__()
+        self.conv1 = nn.Conv2d(4, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        self.fc1 = nn.Linear(64 * 7 * 7, 512)
+        self.fc2 = nn.Linear(512, action_size)
 
-# Custom Observation Wrapper to handle PyBoy screen data
-class PyBoyObservationWrapper(gym.ObservationWrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        self.observation_space = spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
+    def forward(self, x):
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = torch.relu(self.conv3(x))
+        x = x.view(x.size(0), -1)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
-    def observation(self, observation):
-        return observation
+# Replay Memory
+class ReplayMemory:
+    def __init__(self, capacity):
+        self.memory = deque(maxlen=capacity)
 
-# Base PyBoy Environment
-class PyBoyEnv(gym.Env):
-    def __init__(self, rom_path="SuperMarioLand.gb", render=False):
-        super().__init__()
-        self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null")
-        self.pyboy.set_emulation_speed(0)
-        self.action_space = spaces.Discrete(6)
-        self.observation_space = spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
-        self.action_map = ["A", "B", "LEFT", "RIGHT", "UP", "DOWN"]
-        self.prev_screen_hash = None
-        self.render = render
+    def push(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
 
-    def reset(self, seed=None, options=None):
-        self.pyboy.button("START")
-        self.pyboy.tick()
-        self.pyboy.button_release("START")
-        for _ in range(60):
-            self.pyboy.tick()
-        self.prev_screen_hash = None
-        return self._get_obs(), {}
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
 
-    def step(self, action):
-        button = self.action_map[action]
-        self.pyboy.button(button)
-        self.pyboy.tick()
-        self.pyboy.button_release(button)
-        self.pyboy.tick()
-        obs = self._get_obs()
-        reward = self._get_reward(obs)
-        done = self._is_done(obs)
-        return obs, reward, done, False, {}
+    def __len__(self):
+        return len(self.memory)
 
-    def _get_obs(self):
-        screen = self.pyboy.screen.ndarray
-        return screen
-
-    def _get_reward(self, obs):
-        reward = 0.5
-        current_screen_hash = hash(obs.tobytes())
-        if self.prev_screen_hash and current_screen_hash != self.prev_screen_hash:
-            reward += 1.0
-        else:
-            reward -= 0.1
-        self.prev_screen_hash = current_screen_hash
-        return reward
-
-    def _is_done(self, obs):
-        if self.prev_screen_hash is not None:
-            return self.prev_screen_hash == hash(obs.tobytes())
-        return False
-
-    def close(self):
-        self.pyboy.stop(save=False)
-
-# MarioNet (Neural Network for Mario Agent)
-class MarioNet(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        c, h, w = input_dim
-        self.online = nn.Sequential(
-            nn.Conv2d(in_channels=c, out_channels=32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(3136, 512),
-            nn.ReLU(),
-            nn.Linear(512, output_dim),
-        )
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
-            nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
-            if module.bias is not None:
-                module.bias.data.zero_()
-
-    def forward(self, input, model="online"):
-        return self.online(input)
-
-# Mario Agent
-class Mario:
-    def __init__(self, state_dim, action_dim, save_dir, device):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.save_dir = save_dir
-        self.device = device
-
-        self.net = MarioNet(self.state_dim, self.action_dim).float()
-        self.net = self.net.to(device=self.device)
-
-        self.exploration_rate = 1
-        self.exploration_rate_decay = 0.99999975
-        self.exploration_rate_min = 0.1
-        self.curr_step = 0
-
-        self.save_every = 5e5
-
-    def act(self, state):
-        if np.random.rand() < self.exploration_rate:
-            action_idx = np.random.randint(self.action_dim)
-        else:
-            state = state[0].__array__() if isinstance(state, tuple) else state.__array__()
-            state = torch.tensor(state, device=self.device).unsqueeze(0)
-            action_values = self.net(state, model="online")
-            action_idx = torch.argmax(action_values, axis=1).item()
-
-        self.exploration_rate *= self.exploration_rate_decay
-        self.exploration_rate = max(self.exploration_rate_min, self.exploration_rate)
-        self.curr_step += 1
-        return action_idx
-
-    def save(self):
-        save_path = os.path.join(self.save_dir, f"mario_net_{int(self.curr_step // self.save_every)}.chkpt")
-        torch.save(self.net.state_dict(), save_path)
-
-def apply_wrappers(env):
-    env = PyBoyObservationWrapper(env)
-    env = SkipFrame(env, skip=4)
-    env = GymGrayScaleObservation(env)
-    env = GymResizeObservation(env, shape=(84, 84))
-    env = GymFrameStack(env, num_stack=4)
+# Environment Wrappers
+def wrap_env(env):
+    env = JoypadSpace(env, SIMPLE_MOVEMENT)
+    env = ResizeObservation(env, (84, 84))       # gymnasium wrapper
+    env = GrayScaleObservation(env)               # gym wrapper, compatible
+    env = FrameStack(env, num_stack=4)            # Corrected gymnasium wrapper
     return env
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train or play Mario RL agent with PyBoy")
-    parser.add_argument("--cuda", action="store_true", help="Use CUDA (GPU) if available")
-    parser.add_argument("--model_path", type=str, default="models/mario_net.chkpt", help="Path to save/load the model")
-    parser.add_argument("--play", action="store_true", help="Play using the loaded model instead of training")
-    parser.add_argument("--render", action="store_true", help="Render the game window (SDL2)")
-    return parser.parse_args()
+# Agent
+class MarioAgent:
+    def __init__(self, action_size, use_cuda):
+        self.device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
+        if use_cuda and not torch.cuda.is_available():
+            print("Warning: CUDA requested but not available. Falling back to CPU.")
+        print(f"Using device: {self.device}")
+        self.action_size = action_size
+        self.q_network = QNetwork(action_size).to(self.device)
+        self.target_network = QNetwork(action_size).to(self.device)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=LEARNING_RATE)
+        self.memory = ReplayMemory(MEMORY_SIZE)
+        self.epsilon = EPSILON_START
+        self.step = 0
 
-def play_model(env, mario):
-    obs, _ = env.reset()
-    done = False
-    total_reward = 0
-    print("Starting play mode...")
-    while not done:
-        action = mario.act(obs)
-        obs, reward, done, _, _ = env.step(action)
-        total_reward += reward
-        if env.render:
-            time.sleep(0.05)
-    print(f"Play ended. Total reward: {total_reward}")
-    env.close()
+    def act(self, state, play=False):
+        if play or random.random() > self.epsilon:
+            state = torch.FloatTensor(np.array(state)).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                q_values = self.q_network(state)
+            return q_values.max(1)[1].item()
+        return random.randrange(self.action_size)
 
-def train_model(env, mario, total_timesteps, model_path):
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    obs, _ = env.reset()
-    start_time = time.time()
-    with tqdm(total=total_timesteps, desc="Training", unit="timestep") as pbar:
-        for step in range(total_timesteps):
-            action = mario.act(obs)
-            next_obs, reward, done, _, _ = env.step(action)
-            obs = next_obs
+    def learn(self):
+        if len(self.memory) < BATCH_SIZE:
+            return None, None
 
-            pbar.n = step + 1
-            pbar.refresh()
-            elapsed_time = time.time() - start_time
-            if step > 0:
-                time_per_timestep = elapsed_time / step
-                remaining_timesteps = total_timesteps - step
-                time_left = remaining_timesteps * time_per_timestep
-                pbar.set_postfix({"Time Left": f"{time_left:.0f}s"})
+        transitions = self.memory.sample(BATCH_SIZE)
+        batch = tuple(zip(*transitions))
 
-            if mario.curr_step % mario.save_every == 0:
-                mario.save()
+        states = torch.FloatTensor(np.array(batch[0])).to(self.device)
+        actions = torch.LongTensor(batch[1]).to(self.device)
+        rewards = torch.FloatTensor(batch[2]).to(self.device)
+        next_states = torch.FloatTensor(np.array(batch[3])).to(self.device)
+        dones = torch.FloatTensor(batch[4]).to(self.device)
 
-            if done:
-                obs, _ = env.reset()
+        q_values = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        next_q_values = self.target_network(next_states).max(1)[0]
+        targets = rewards + (1 - dones) * GAMMA * next_q_values
 
-    mario.save()
-    print(f"Model saved to {os.path.dirname(model_path)}")
+        loss = nn.MSELoss()(q_values, targets.detach())
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.step += 1
+        if self.step % TARGET_UPDATE == 0:
+            self.target_network.load_state_dict(self.q_network.state_dict())
+
+        if self.epsilon > EPSILON_END:
+            self.epsilon *= EPSILON_DECAY
+
+        return q_values.mean().item(), loss.item()
+
+    def save(self, path):
+        torch.save(self.q_network.state_dict(), path)
+
+    def load(self, path):
+        self.q_network.load_state_dict(torch.load(path))
+        self.target_network.load_state_dict(self.q_network.state_dict())
+
+def main():
+    parser = argparse.ArgumentParser(description="Train or play Super Mario Bros with DDQN")
+    parser.add_argument("--render", action="store_true", help="Render the environment")
+    parser.add_argument("--resume", action="store_true", help="Resume training from model_path")
+    parser.add_argument("--debug", action="store_true", help="Print debug info")
+    parser.add_argument("--play", action="store_true", help="Play using the model at model_path")
+    parser.add_argument("--model_path", type=str, default="mario_model.pth", help="Path to save/load model")
+    parser.add_argument("--episodes", type=int, default=1000, help="Number of training episodes")
+    parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
+    args = parser.parse_args()
+
+    # Initialize environment and agent
+    env = gym_super_mario_bros.make("SuperMarioBros-1-1-v3", render_mode="human" if args.render else "rgb_array")
+    env = wrap_env(env)
+    agent = MarioAgent(ACTION_SIZE, use_cuda=args.cuda)
+
+    # Load model if resuming or playing
+    if (args.resume or args.play) and os.path.exists(args.model_path):
+        agent.load(args.model_path)
+        print(f"Loaded model from {args.model_path}")
+
+    if args.play:
+        # Play mode
+        state, _ = env.reset()  # Modern API: (obs, info)
+        total_reward = 0
+        done = False
+        while not done:
+            if args.render:
+                env.render()
+            action = agent.act(state, play=True)
+            next_state, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            state = next_state
+            done = terminated or truncated
+            if args.debug:
+                print(f"Action: {action}, Reward: {reward}, Info: {info}")
+        print(f"Total Reward: {total_reward}")
+    else:
+        # Training mode
+        for episode in range(args.episodes):
+            state, _ = env.reset()  # Modern API: (obs, info)
+            total_reward = 0
+            done = False
+            while not done:
+                if args.render:
+                    env.render()
+                action = agent.act(state)
+                next_state, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                agent.memory.push(state, action, reward, next_state, done)
+                q, loss = agent.learn()
+                total_reward += reward
+                state = next_state
+
+                if args.debug and q is not None:
+                    print(f"Episode: {episode}, Step: {agent.step}, Q: {q:.2f}, Loss: {loss:.4f}, Epsilon: {agent.epsilon:.3f}")
+
+            print(f"Episode {episode + 1}/{args.episodes}, Total Reward: {total_reward}")
+            if (episode + 1) % 10 == 0:
+                agent.save(args.model_path)
+                print(f"Saved model to {args.model_path}")
+
     env.close()
 
 if __name__ == "__main__":
-    args = parse_args()
-    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    base_env = PyBoyEnv(render=args.render)
-    env = apply_wrappers(base_env)
-    total_timesteps = 90_000
-
-    state_dim = (4, 84, 84)
-    action_dim = env.action_space.n
-    save_dir = os.path.dirname(args.model_path) or "./models"
-    mario = Mario(state_dim, action_dim, save_dir, device)
-
-    if args.play:
-        if os.path.exists(args.model_path):
-            print(f"Loading model from {args.model_path}")
-            mario.net.load_state_dict(torch.load(args.model_path))
-            mario.net.eval()
-        else:
-            print(f"Error: No model found at {args.model_path}")
-            exit(1)
-        play_model(env, mario)
-    else:
-        train_model(env, mario, total_timesteps, args.model_path)
+    main()

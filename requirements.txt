@@ -1,11 +1,6 @@
-gymnasium>=1.1.1
-pyboy>=2.5.1
-torch>=2.6.0
-torchvision>=0.21.0
-numpy>=2.2.4
-opencv-python>=4.11.0
-tqdm>=4.66.0
-filelock>=3.18.0
-pillow>=10.3.0
-pysdl2>=0.9.17
-pysdl2-dll>=2.32.0
+gym-super-mario-bros>=7.4.0  # Latest version (e.g., 7.5.0 or higher if available)
+nes-py>=8.2.1  # Latest compatible version
+torch==2.6.0+cu121  # Adjust based on availability
+torchvision==0.21.0+cu121
+numpy>=1.26.4
+gym>=0.27.0  # Latest Gym API
